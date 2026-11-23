@@ -1219,7 +1219,7 @@ class FlashAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: FlashAttentionMetadata,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
@@ -1232,8 +1232,9 @@ class FlashAttentionImpl(AttentionImpl):
             query: shape = [num_tokens, num_heads, head_size]
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
-            kv_cache: shape =
-                [num_blocks, num_kv_heads, block_size, 2 * head_size]
+            kv_cache: Packed [num_blocks, num_kv_heads, block_size, 2 * head_size]
+                cache, or separate [num_blocks, block_size, num_kv_heads,
+                head_size] K and V views from staged prefill.
             attn_metadata: Metadata for attention.
             output: Tensor that the attention result is written into.
             output_scale: Scale for fused output quantization; not supported
@@ -1288,7 +1289,12 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
-        key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
+        if isinstance(kv_cache, tuple):
+            key_cache, value_cache = kv_cache
+        else:
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
+                self.head_size, dim=-1
+            )
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
         # FA3/4 on H100+ uses TMA, which requires ≥16-byte stride alignment.
         # See vllm.utils.torch_utils.canonicalize_singleton_dim_strides.

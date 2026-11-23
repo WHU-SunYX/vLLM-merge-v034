@@ -16,8 +16,11 @@ from vllm.v1.worker.gpu.kv_connector import ActiveKVConnector
 def _make_connector(
     monkeypatch: pytest.MonkeyPatch,
     events: list[str],
+    *,
+    requires_load_before_forward: bool = False,
 ) -> ActiveKVConnector:
     backend = Mock()
+    backend.requires_load_before_forward.return_value = requires_load_before_forward
     backend.handle_preemptions.side_effect = lambda _: events.append("handle")
     backend.bind_connector_metadata.side_effect = lambda _: events.append("bind")
     backend.start_load_kv.side_effect = lambda *_args, **_kwargs: events.append("start")
@@ -58,12 +61,16 @@ def _scheduler_output(has_sync_kv_loads: bool) -> SimpleNamespace:
 
 
 @pytest.mark.parametrize("has_sync_kv_loads", [False, True])
+@pytest.mark.parametrize("requires_load_before_forward", [False, True])
 def test_load_start_phase(
     monkeypatch: pytest.MonkeyPatch,
     has_sync_kv_loads: bool,
+    requires_load_before_forward: bool,
 ):
     events: list[str] = []
-    connector = _make_connector(monkeypatch, events)
+    connector = _make_connector(
+        monkeypatch, events, requires_load_before_forward=requires_load_before_forward
+    )
     output = _scheduler_output(has_sync_kv_loads)
 
     request_indices = torch.tensor([3, 1])
@@ -73,8 +80,9 @@ def test_load_start_phase(
     )
     attn_metadata = {"layer": object()}
     connector.pre_forward(output, input_batch, attn_metadata=attn_metadata)
+    expect_pre_forward_load = has_sync_kv_loads or requires_load_before_forward
     assert events == (
-        ["handle", "bind", "start"] if has_sync_kv_loads else ["handle", "bind"]
+        ["handle", "bind", "start"] if expect_pre_forward_load else ["handle", "bind"]
     )
 
     connector.post_forward(set())

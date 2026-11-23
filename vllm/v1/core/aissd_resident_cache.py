@@ -68,7 +68,6 @@ def validate_resident_config(config):
         "--enforce-eager": config.model_config.enforce_eager,
         "--max-num-seqs 1": scheduler.max_num_seqs == 1,
         "--no-async-scheduling": not scheduler.async_scheduling,
-        "VLLM_USE_V2_MODEL_RUNNER=0": not config.use_v2_model_runner,
         "--no-enable-prefix-caching": not cache.enable_prefix_caching,
         "single GPU (TP/PP/DCP/PCP/DP=1)": all(
             getattr(parallel, name, 1) == 1

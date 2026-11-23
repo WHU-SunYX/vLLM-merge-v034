@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import cache
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import torch
@@ -3529,6 +3531,27 @@ if hasattr(torch.ops._C, "minimax_allreduce_rms_qk"):
 
 
 
+@cache
+def _get_aissd_op(name: str):
+    try:
+        import_module("vllm._C_aissd")
+    except ImportError as exc:
+        raise RuntimeError(
+            "AI-SSD requires the vllm._C_aissd extension. "
+            "Build vLLM from source with CUDA and the installed PyTorch."
+        ) from exc
+    return getattr(torch.ops._C, name)
+
+
+def _aissd_attention_cache_view(
+    kv_cache: torch.Tensor, head_size: int
+) -> torch.Tensor:
+    # [B, H, N, 2*D] -> [2, B, N, H, D]. The legacy kernels use strides.
+    if kv_cache.ndim == 4:
+        return kv_cache.unflatten(-1, (2, head_size)).permute(3, 0, 2, 1, 4)
+    return kv_cache
+
+
 # AI-SSD sparse FlashAttention-style op wrapper.
 def sparse_flash_attention(
     out: torch.Tensor,
@@ -3542,6 +3565,7 @@ def sparse_flash_attention(
     slot_mapping_table: torch.Tensor,
     selected_block_table: torch.Tensor,
     selected_block_lens: torch.Tensor,
+    selected_token_lens: torch.Tensor,
     selected_ready_flags: torch.Tensor,
     debug_counters: torch.Tensor,
     block_size: int,
@@ -3555,17 +3579,11 @@ def sparse_flash_attention(
     sparse_ssd_attention baseline op.  It consumes stable device tensors plus
     selected-block metadata prepared by LMCache before model execution.
     """
-    op = getattr(torch.ops._C, "sparse_flash_attention", None)
-    if op is None:
-        raise RuntimeError(
-            "torch.ops._C.sparse_flash_attention is not registered. "
-            "Build/register vllm/csrc/attention/sparse_flash_attention.cu before "
-            "enabling lmcache.enable_sparse_attention."
-        )
+    op = _get_aissd_op("sparse_flash_attention")
     op(
         out,
         query,
-        kv_cache,
+        _aissd_attention_cache_view(kv_cache, query.shape[-1]),
         active_reqs if active_reqs is not None else torch.zeros((), dtype=torch.int32, device=query.device),
         req_token_lens,
         req_vllm_cached_tokens,
@@ -3574,6 +3592,7 @@ def sparse_flash_attention(
         slot_mapping_table,
         selected_block_table,
         selected_block_lens,
+        selected_token_lens,
         selected_ready_flags,
         debug_counters,
         block_size,
@@ -3628,13 +3647,7 @@ def aissd_sparse_kv_select(
     manifest_block_size: int,
     timeout_ms: int,
 ) -> None:
-    op = getattr(torch.ops._C, "aissd_sparse_kv_select", None)
-    if op is None:
-        raise RuntimeError(
-            "torch.ops._C.aissd_sparse_kv_select is not registered. "
-            "Rebuild vLLM with the updated sparse_flash_attention custom op before "
-            "setting lmcache.sparse_kv_backend=ssd-cpu/ssd-npu."
-        )
+    op = _get_aissd_op("aissd_sparse_kv_select")
     op(
         query,
         active_reqs,
@@ -3703,17 +3716,11 @@ def sparse_ssd_attention(
     graph-capturable request tensors plus selected-block metadata prepared by
     LMCache before model execution.
     """
-    op = getattr(torch.ops._C, "sparse_ssd_attention", None)
-    if op is None:
-        raise RuntimeError(
-            "torch.ops._C.sparse_ssd_attention is not registered. "
-            "Build/register vllm/csrc/attention/sparse_ssd_attention.cu before "
-            "enabling lmcache.enable_sparse_attention."
-        )
+    op = _get_aissd_op("sparse_ssd_attention")
     op(
         out,
         query,
-        kv_cache,
+        _aissd_attention_cache_view(kv_cache, query.shape[-1]),
         active_reqs if active_reqs is not None else torch.zeros((), dtype=torch.int32, device=query.device),
         req_token_lens,
         req_vllm_cached_tokens,

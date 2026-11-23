@@ -1612,6 +1612,8 @@ if _is_cpu():
         ext_modules.append(CMakeExtension(name="vllm._C"))
 
 if _build_custom_ops():
+    if _is_cuda() and not USE_PRECOMPILED_EXTENSIONS:
+        ext_modules.append(CMakeExtension(name="vllm._C_aissd"))
     if _is_hip():
         ext_modules.append(CMakeExtension(name="vllm._C"))
     if _is_cuda() or _is_hip():

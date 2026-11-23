@@ -193,6 +193,30 @@ def estimate_max_model_len(
         vllm_config.model_config.max_model_len = original_max_model_len
 
 
+def _check_aissd_prefill_memory(
+    vllm_config: VllmConfig,
+    groups: list[KVCacheGroupSpec],
+    bytes_per_block: int,
+    available_memory: int,
+) -> None:
+    from vllm.v1.core.aissd_resident_cache import (
+        staged_prefill_pool_blocks,
+        validate_resident_config,
+    )
+
+    validate_resident_config(vllm_config)
+    if len(groups) != 1 or type(groups[0].kv_cache_spec) is not FullAttentionSpec:
+        raise ValueError("AISSD staged prefill requires one FullAttentionSpec group")
+    required_blocks = staged_prefill_pool_blocks(vllm_config)
+    required_bytes = required_blocks * bytes_per_block
+    if available_memory < required_bytes:
+        raise ValueError(
+            f"AISSD staged prefill requires {required_blocks} GPU KV blocks "
+            f"including the null block ({required_bytes} bytes); "
+            f"available={available_memory} bytes"
+        )
+
+
 def check_enough_kv_cache_memory(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -212,15 +236,18 @@ def check_enough_kv_cache_memory(
     """
     # No need to check for available memory if the kv_cache_spec is empty
     if kv_cache_spec:
-        # Reserve the null block BlockPool permanently holds back, so the check
-        # plans against usable blocks, as in get_kv_cache_configs. Group a copy
-        # of the specs since grouping may unify them in-place.
+        from vllm.v1.core.aissd_resident_cache import staged_prefill_enabled
+
+        # Group a copy of the specs since grouping may unify them in-place.
         groups = get_kv_cache_groups(vllm_config, dict(kv_cache_spec))
-        check_memory = (
-            available_memory - _pool_bytes_per_block(vllm_config, groups)
-            if groups
-            else available_memory
-        )
+        bytes_per_block = _pool_bytes_per_block(vllm_config, groups) if groups else 0
+        if staged_prefill_enabled(vllm_config):
+            _check_aissd_prefill_memory(
+                vllm_config, groups, bytes_per_block, available_memory
+            )
+            return
+        # Reserve the null block BlockPool permanently holds back.
+        check_memory = available_memory - bytes_per_block
         _check_enough_kv_cache_memory(
             check_memory,
             lambda: max_memory_usage_bytes(vllm_config, kv_cache_spec.values()),
@@ -1599,7 +1626,12 @@ def get_kv_cache_configs(
         The generated KVCacheConfigs for each worker.
 
     """
+    from vllm.v1.core.aissd_resident_cache import staged_prefill_enabled
+
     builder = get_kv_cache_config_builder(vllm_config)
+    staged_prefill = staged_prefill_enabled(vllm_config)
+    if staged_prefill and vllm_config.model_config.original_max_model_len == -1:
+        raise ValueError("AISSD staged prefill requires an explicit --max-model-len")
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
@@ -1650,8 +1682,15 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, check_memory):
+    for groups, total_mem, avail_mem in zip(
+        projected_groups_per_worker, available_memory, check_memory
+    ):
         if not groups:
+            continue
+        if staged_prefill:
+            _check_aissd_prefill_memory(
+                vllm_config, groups, total_mem - avail_mem, total_mem
+            )
             continue
         _check_enough_kv_cache_memory(
             avail_mem,
@@ -1831,9 +1870,20 @@ def shrink_kv_cache_configs(
     tensors' size follows (their strides and offsets keep describing the
     reservation). Raises if max_model_len no longer fits.
     """
+    from vllm.v1.core.aissd_resident_cache import staged_prefill_enabled
+
     builder = get_kv_cache_config_builder(vllm_config)
+    staged_prefill = staged_prefill_enabled(vllm_config)
     for kv_cache_config in kv_cache_configs:
         assert num_blocks <= kv_cache_config.num_blocks
+        groups = kv_cache_config.kv_cache_groups
+        if staged_prefill and groups:
+            bytes_per_block = _pool_bytes_per_block_from_builder(
+                builder, vllm_config, groups
+            )
+            _check_aissd_prefill_memory(
+                vllm_config, groups, bytes_per_block, num_blocks * bytes_per_block
+            )
         kv_cache_config.kv_cache_tensors = [
             tensor
             if tensor.host_resident
@@ -1842,8 +1892,7 @@ def shrink_kv_cache_configs(
             )
             for tensor in kv_cache_config.kv_cache_tensors
         ]
-        groups = kv_cache_config.kv_cache_groups
-        if groups:
+        if groups and not staged_prefill:
             # The null block is held back by the BlockPool, as in the capacity
             # check of `get_kv_cache_configs`.
             _check_enough_kv_cache_memory(

@@ -341,6 +341,10 @@ class KVConnectorBase_V1(ABC):
         """Reset worker state mutated while capturing CUDA graphs."""
         return
 
+    def requires_load_before_forward(self) -> bool:
+        """Whether start_load_kv prepares state needed by every forward."""
+        return False
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         """Handle preempted requests or evicted blocks BEFORE they are overwritten.
         Needed for connectors which use async saves (e.g., OffloadingConnector)

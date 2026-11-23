@@ -402,6 +402,27 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 endif() # _C HIP endif
 
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  # These fork kernels use ATen tensors, so keep them in a separate extension
+  # built against the installed PyTorch ABI.
+  set(AISSD_EXT_SRC
+    "csrc/attention/aissd_torch_bindings.cpp"
+    "csrc/attention/sparse_ssd_attention.cu"
+    "csrc/attention/sparse_flash_attention.cu")
+  set_gencode_flags_for_srcs(
+    SRCS "${AISSD_EXT_SRC}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+  define_extension_target(
+    _C_aissd
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${AISSD_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    LIBRARIES ${CMAKE_DL_LIBS}
+    USE_SABI 3
+    WITH_SOABI)
+endif()
+
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   #
   # _C_stable_libtorch extension (ops registered via STABLE_TORCH_LIBRARY)
@@ -445,9 +466,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 
   set(VLLM_STABLE_EXT_SRC
     "csrc/torch_bindings.cpp"
-    "csrc/attention/sparse_ssd_attention.cu"
-  "csrc/attention/sparse_flash_attention.cu"
-  "csrc/cuda_view.cu"
+    "csrc/cuda_view.cu"
     "csrc/cuda_utils_kernels.cu"
     "csrc/activation_kernels.cu"
     "csrc/muse_spark_mul_tanh_soft_cap_kernel.cu"

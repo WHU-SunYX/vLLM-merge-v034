@@ -14,7 +14,7 @@ disabled, and can optionally fall back to FlashAttention only in debug/dry-run
 mode where full KV remains available.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import copy
 import hashlib
 import json
@@ -33,6 +33,7 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionMetadata,
     AttentionType,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -43,6 +44,10 @@ try:
 except Exception:  # pragma: no cover - depends on vLLM/flash-attn build
     flash_attn_varlen_func = None
 from vllm import _custom_ops as vllm_ops
+from vllm.v1.kv_cache_layout import KVCacheLayout
+
+if TYPE_CHECKING:
+    from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
 
@@ -6519,32 +6524,14 @@ class SparseSSDAttentionBackend(AttentionBackend):
         return FlashAttentionBackend.get_builder_cls()
 
     @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return FlashAttentionBackend.get_kv_cache_shape(
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_size,
-            cache_dtype_str=cache_dtype_str,
-        )
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        return FlashAttentionBackend.get_kv_cache_stride_order(
-            include_num_layers_dimension=include_num_layers_dimension
-        )
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: "KVCacheSpec | None" = None,
+    ) -> list[int | MultipleOf]:
+        return FlashAttentionBackend.get_supported_kernel_block_sizes(kv_cache_spec)
 
     @classmethod
-    def get_supported_head_sizes(cls) -> list[int]:
-        return FlashAttentionBackend.get_supported_head_sizes()
+    def supports_head_size(cls, head_size: int) -> bool:
+        return FlashAttentionBackend.supports_head_size(head_size)
 
     @classmethod
     def supports_dtype(cls, dtype: torch.dtype) -> bool:
@@ -6591,8 +6578,12 @@ class SparseSSDAttentionBackend(AttentionBackend):
         return FlashAttentionBackend.supports_compute_capability(capability)
 
     @classmethod
-    def get_required_kv_cache_layout(cls):
-        return FlashAttentionBackend.get_required_kv_cache_layout()
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
+        return (KVCacheLayout.LBNHC, KVCacheLayout.LBHNC)
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        return False
 
     @classmethod
     def is_sparse(cls) -> bool:
@@ -6890,16 +6881,6 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                 seq_lens=sparse_seq_lens,
                 block_table=sparse_block_table,
                 slot_mapping=torch.empty(0, dtype=torch.long, device=query.device),
-                use_cascade=False,
-                common_prefix_len=0,
-                cu_prefix_query_lens=None,
-                prefix_kv_lens=None,
-                suffix_kv_lens=None,
-                max_dcp_context_kv_len=None,
-                dcp_context_kv_lens=None,
-                scheduler_metadata=None,
-                prefix_scheduler_metadata=None,
-                max_num_splits=0,
                 causal=False,
             )
             if _sparse_kv_debug_enabled() and not torch.cuda.is_current_stream_capturing():
@@ -6924,12 +6905,6 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
             sparse_meta.block_table = sparse_block_table
             sparse_meta.max_seq_len = sparse_max_seq_len
             sparse_meta.causal = False
-            sparse_meta.use_cascade = False
-            sparse_meta.common_prefix_len = 0
-            sparse_meta.cu_prefix_query_lens = None
-            sparse_meta.prefix_kv_lens = None
-            sparse_meta.suffix_kv_lens = None
-            sparse_meta.prefix_scheduler_metadata = None
             # Scheduler metadata produced for the original dense sequence does not
             # describe the compacted selected-block sequence, so disable it for the
             # sparse FA route.  FA will use its normal non-AOT scheduling.

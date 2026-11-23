@@ -871,10 +871,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Capture warmup providers that depend on allocated KV-cache strides.
         with self.jit_warmup_registry.activate():
-            # init_kv_cache() expects the attention groups returned by
-        # init_attn_backend().
-        kv_caches_dict = init_kv_cache(
-
+            kv_caches_dict = init_kv_cache(
                 self.compilation_config.static_forward_context,
                 self.kv_cache_config,
                 self.device,
@@ -1386,7 +1383,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
-            if req_new_block_ids is not None:
+            resident_state = scheduler_output.aissd_resident_states.get(req_id)
+            if resident_state is not None:
+                # Released prefix pages become null entries in the logical row.
+                self.block_tables.append_block_ids(
+                    req_index, (resident_state["logical_block_ids"],), overwrite=True
+                )
+            elif req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )

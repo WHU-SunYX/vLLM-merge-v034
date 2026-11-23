@@ -144,6 +144,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 engine.layerwise_retrievers = []
             engine.layerwise_storers = []
 
+    def requires_load_before_forward(self) -> bool:
+        hook = getattr(self._lmcache_engine, "requires_load_before_forward", None)
+        return hook is not None and hook()
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """Start loading the KV cache from the connector to vLLM's paged
         KV buffer. This is called from the forward context before the

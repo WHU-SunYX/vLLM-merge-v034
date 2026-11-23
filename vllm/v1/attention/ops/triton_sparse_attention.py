@@ -26,13 +26,16 @@ def _as_token_head_dim(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def _get_kv_from_cache(kv_cache: Any, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _get_kv_from_cache(
+    kv_cache: Any, block_id: int, head_size: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract one block from vLLM-style paged KV cache.
 
     Supported forms:
       - tuple/list: (key_cache, value_cache)
       - tensor [2, num_blocks, block, kv_heads, head]
       - tensor [num_blocks, 2, block, kv_heads, head]
+      - tensor [num_blocks, kv_heads, block, 2 * head]
       - tensor [num_blocks, block, kv_heads, head] (K=V fallback for debugging)
     """
     if isinstance(kv_cache, (tuple, list)):
@@ -55,6 +58,9 @@ def _get_kv_from_cache(kv_cache: Any, block_id: int) -> tuple[torch.Tensor, torc
             _as_token_head_dim(kv_cache[block_id, 1]),
         )
     if kv_cache.ndim == 4:
+        if head_size is not None and kv_cache.shape[-1] == 2 * head_size:
+            key, value = kv_cache[block_id].transpose(0, 1).split(head_size, dim=-1)
+            return key, value
         # Debug-only fallback when only one cache tensor is supplied.
         block = _as_token_head_dim(kv_cache[block_id])
         return block, block
@@ -131,7 +137,7 @@ def triton_sparse_paged_attention(
         k_blocks = []
         v_blocks = []
         for block_id in block_ids:
-            k_block, v_block = _get_kv_from_cache(kv_cache, block_id)
+            k_block, v_block = _get_kv_from_cache(kv_cache, block_id, query.shape[-1])
             k_blocks.append(k_block.to(device=device, dtype=dtype))
             v_blocks.append(v_block.to(device=device, dtype=dtype))
         k = _repeat_kv_heads(torch.cat(k_blocks, dim=0), num_heads)

@@ -240,6 +240,7 @@ def get_attn_backend(
         backend = attention_config.backend_per_kind.get(kind.value, backend)
 
     if _sparse_ssd_attention_requested(vllm_config):
+        from vllm.platforms import current_platform
         from vllm.v1.attention.backends.sparse_ssd_attn import (
             SparseSSDAttentionBackend,
         )
@@ -251,15 +252,30 @@ def get_attn_backend(
             block_size=attn_selector_config.block_size,
             use_mla=attn_selector_config.use_mla,
             has_sink=attn_selector_config.has_sink,
-            use_sparse=False,
+            use_sparse=attn_selector_config.use_sparse,
             use_mm_prefix=attn_selector_config.use_mm_prefix,
             use_per_head_quant_scales=attn_selector_config.use_per_head_quant_scales,
             device_capability=current_platform.get_device_capability(),
             attn_type=attn_selector_config.attn_type,
+            has_sliding_window=attn_selector_config.has_sliding_window,
             use_non_causal=attn_selector_config.use_non_causal,
             use_batch_invariant=attn_selector_config.use_batch_invariant,
+            use_kv_connector=attn_selector_config.use_kv_connector,
+            use_pcp=attn_selector_config.use_pcp,
+            use_adaptive_verification=attn_selector_config.use_adaptive_verification,
+            use_dcp=attn_selector_config.use_dcp,
+            use_rswa=attn_selector_config.use_rswa,
         )
+        if not current_platform.is_cuda():
+            invalid_reasons.append("AI-SSD requires CUDA")
         if invalid_reasons:
+            from vllm.v1.core.aissd_resident_cache import resident_options
+
+            if resident_options(vllm_config)[0] > 0:
+                raise ValueError(
+                    "AISSD GPU residency requires SPARSE_SSD attention: "
+                    + ", ".join(invalid_reasons)
+                )
             logger.warning(
                 "SPARSE_SSD attention requested but unsupported for %s: %s; "
                 "falling back to platform backend",
