@@ -5,7 +5,7 @@ import importlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING, cast
 
-from vllm.config.kv_transfer import KVTransferConfig
+from vllm.config.kv_transfer import KVCacheAccess, KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.base import (
     KVConnectorBase,
     KVConnectorBaseType,
@@ -87,6 +87,7 @@ class KVConnectorFactory:
 
         Returns:
             The connector class.
+
         """
         if connector_name not in cls._registry:
             raise ValueError(f"Connector '{connector_name}' is not registered.")
@@ -122,10 +123,33 @@ class KVConnectorFactory:
                 logger.error(msg)
                 raise ValueError(msg)
         elif connector_name in cls._registry:
+            if connector_name == "NixlConnector":
+                mode = kv_transfer_config.get_from_extra_config("transfer_mode", "pull")
+                if mode not in ("pull", "push"):
+                    raise ValueError(f"Invalid NixlConnector transfer_mode: {mode!r}")
+                connector_name = f"Nixl{mode.capitalize()}Connector"
             connector_cls = cls._registry[connector_name]()
         else:
             raise ValueError(f"Unsupported connector type: {connector_name}")
         return connector_cls
+
+    @classmethod
+    def kv_cache_access(cls, kv_transfer_config: "KVTransferConfig") -> KVCacheAccess:
+        """How the configured connector reaches the device KV cache, from its
+        `kv_cache_access` classmethod."""
+        connector_cls = cls.get_connector_class(kv_transfer_config)
+        access = connector_cls.kv_cache_access(kv_transfer_config)
+        # TODO: drop once the minimum lmcache version overrides the classmethod.
+        # The lmcache package's LMCacheMPConnector, which replaces vLLM's
+        # builtin one when installed, may predate it.
+        if (
+            kv_transfer_config.kv_connector == "LMCacheMPConnector"
+            and not kv_transfer_config.kv_connector_module_path
+            and next(c for c in connector_cls.__mro__ if "kv_cache_access" in vars(c))
+            is KVConnectorBaseType
+        ):
+            access = KVCacheAccess.LEGACY_IPC
+        return access
 
     @classmethod
     def supports_hma_config(cls, kv_transfer_config: "KVTransferConfig") -> bool:
@@ -162,12 +186,6 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
-    "P2pNcclConnector",
-    "vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_connector",
-    "P2pNcclConnector",
-)
-
-KVConnectorFactory.register_connector(
     "LMCacheConnectorV1",
     "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
     "LMCacheConnectorV1",
@@ -186,9 +204,27 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "NixlPullConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+    "NixlPullConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "NixlPushConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.nixl",
+    "NixlPushConnector",
+)
+
+KVConnectorFactory.register_connector(
     "MultiConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.multi_connector",
     "MultiConnector",
+)
+
+KVConnectorFactory.register_connector(
+    "HiSparseConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.hisparse.connector",
+    "HiSparseConnector",
 )
 
 KVConnectorFactory.register_connector(
@@ -218,6 +254,11 @@ KVConnectorFactory.register_connector(
     "MooncakeStoreConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store.connector",
     "MooncakeStoreConnector",
+)
+KVConnectorFactory.register_connector(
+    "UMBPStoreConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.umbp",
+    "UMBPStoreConnector",
 )
 KVConnectorFactory.register_connector(
     "FlexKVConnectorV1",
