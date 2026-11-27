@@ -26,6 +26,10 @@ import time
 
 import torch
 
+from vllm.distributed.parallel_state import (
+    get_tp_group,
+    model_parallel_is_initialized,
+)
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -35,6 +39,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.backends.aissd_tp import run_tp_ssd_selector
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionMetadata,
@@ -5462,6 +5467,133 @@ def _aissd_host_selected_block_diagnostics_enabled(
     )
 
 
+def _aissd_run_native_selector(
+    query: torch.Tensor,
+    step_context: dict[str, Any],
+    layer_id: int,
+    backend: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> None:
+    vllm_ops.aissd_sparse_kv_select(
+        query,
+        step_context["active_reqs"],
+        step_context["req_token_lens"],
+        step_context["req_lmcache_cached_tokens"],
+        step_context["aissd_candidate_count"],
+        step_context["aissd_candidate_chunk_ids"],
+        step_context["aissd_candidate_block_ids"],
+        step_context["aissd_candidate_block_lens"],
+        step_context["aissd_candidate_token_start"],
+        step_context["aissd_candidate_token_end"],
+        step_context["aissd_candidate_dtype"],
+        step_context["aissd_candidate_fmt"],
+        step_context["aissd_candidate_ndim"],
+        step_context["aissd_candidate_shape"],
+        step_context["aissd_candidate_extent_count"],
+        step_context["aissd_candidate_extent_lba"],
+        step_context["aissd_candidate_extent_bytes"],
+        step_context["local_block_table"],
+        step_context["local_block_lens"],
+        step_context["local_token_lens"],
+        step_context["selected_block_table"],
+        step_context["selected_block_lens"],
+        step_context["selected_ready_flags"],
+        step_context["fa_block_table"],
+        step_context["fa_block_lens"],
+        step_context["fa_seq_lens"],
+        step_context["aissd_rpc_selected_chunk_ids"],
+        step_context["aissd_rpc_selected_chunk_lens"],
+        layer_id,
+        backend,
+        int(num_heads),
+        int(num_kv_heads),
+        int(head_size),
+        int(step_context["chunk_size"]),
+        int(step_context["block_size"]),
+        int(step_context["top_n_chunks"]),
+        int(step_context.get("aissd_top_m", 8)),
+        int(step_context.get("aissd_score_mode_code", 1)),
+        int(step_context.get("aissd_manifest_block_size", 4096)),
+        int(step_context.get("aissd_timeout_ms", 300000)),
+    )
+
+
+def _aissd_run_tp_selector(
+    query: torch.Tensor,
+    step_context: dict[str, Any],
+    layer_name: str,
+    backend: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+) -> float:
+    tp_size = int(step_context["aissd_tp_size"])
+    tp_rank = int(step_context["aissd_tp_rank"])
+    layer_id = _aissd_parse_layer_id(layer_name, step_context)
+    generation = int(step_context["context_generation"])
+    backend_name = step_context["aissd_selector_backend"]
+
+    def select_on_leader(full_query: torch.Tensor) -> None:
+        _aissd_select_candidate_tensors_for_layer(step_context, layer_id)
+        _aissd_ensure_rpc_selected_chunk_buffers(step_context)
+        _aissd_run_native_selector(
+            full_query,
+            step_context,
+            layer_id,
+            backend,
+            num_heads * tp_size,
+            num_kv_heads * tp_size,
+            head_size,
+        )
+
+    start = time.perf_counter()
+    profile = _sparse_profile_begin("aissd_selector_op", layer_name, query)
+    starts = run_tp_ssd_selector(get_tp_group(), query, step_context, select_on_leader)
+    _sparse_profile_end(profile, step_context, query, impl=backend_name)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    token_step = _aissd_token_reuse_virtual_step(step_context, generation, layer_id)
+    step_context.update(
+        aissd_selector_ms=elapsed_ms,
+        aissd_selector_reused=False,
+        aissd_selector_real_layer=layer_name,
+        aissd_selector_real_layer_id=layer_id,
+        aissd_selector_real_generation=generation,
+        aissd_selector_reuse_strategy="none",
+        aissd_selector_token_reuse_strategy="none",
+        aissd_selector_token_step=token_step,
+    )
+    if tp_rank == 0 and _aissd_selector_stats_enabled():
+        logger.info(
+            "[aissd-selector-latency] layer=%s generation=%d backend=%s "
+            "elapsed_ms=%.3f active_reqs=1 candidates=%d top_n=%s "
+            "reuse_layers=False token_reuse_strategy=none token_step=%d tp_size=%d",
+            layer_name,
+            generation,
+            backend_name,
+            elapsed_ms,
+            int(step_context["aissd_candidate_count"][0]),
+            step_context.get("top_n_chunks"),
+            token_step,
+            tp_size,
+        )
+    if _sparse_kv_debug_enabled():
+        logger.info(
+            "[aissd-tp-selector] rank=%d tp_size=%d req_id=%s layer=%d "
+            "token_step=%d chunk_starts=%s remote_blocks=%s tail_tokens=%s",
+            tp_rank,
+            tp_size,
+            step_context["req_ids"][0],
+            layer_id,
+            token_step,
+            starts,
+            step_context["host_selected_blocks"],
+            step_context["host_local_tokens"],
+        )
+    return elapsed_ms
+
+
 def _maybe_run_aissd_selector_op(
     query: torch.Tensor,
     step_context: dict[str, Any],
@@ -5523,6 +5655,11 @@ def _maybe_run_aissd_selector_op(
         step_context["aissd_selector_reused"] = False
         step_context["aissd_selector_real_layer"] = None
         return 0.0
+
+    if int(step_context.get("aissd_tp_size", 1)) > 1:
+        return _aissd_run_tp_selector(
+            query, step_context, layer_name, backend, num_heads, num_kv_heads, head_size
+        )
 
     generation = int(step_context.get("context_generation", -1) or -1)
     token_reuse_strategy = _aissd_token_reuse_strategy()
@@ -5998,47 +6135,8 @@ def _maybe_run_aissd_selector_op(
             step_context, query, int(layer_id), int(num_heads), float(attention_scale))
     t0 = time.perf_counter()
     selector_prof = _sparse_profile_begin("aissd_selector_op", layer_name, query)
-    vllm_ops.aissd_sparse_kv_select(
-        query,
-        step_context["active_reqs"],
-        step_context["req_token_lens"],
-        step_context["req_lmcache_cached_tokens"],
-        step_context["aissd_candidate_count"],
-        step_context["aissd_candidate_chunk_ids"],
-        step_context["aissd_candidate_block_ids"],
-        step_context["aissd_candidate_block_lens"],
-        step_context["aissd_candidate_token_start"],
-        step_context["aissd_candidate_token_end"],
-        step_context["aissd_candidate_dtype"],
-        step_context["aissd_candidate_fmt"],
-        step_context["aissd_candidate_ndim"],
-        step_context["aissd_candidate_shape"],
-        step_context["aissd_candidate_extent_count"],
-        step_context["aissd_candidate_extent_lba"],
-        step_context["aissd_candidate_extent_bytes"],
-        step_context["local_block_table"],
-        step_context["local_block_lens"],
-        step_context["local_token_lens"],
-        step_context["selected_block_table"],
-        step_context["selected_block_lens"],
-        step_context["selected_ready_flags"],
-        step_context["fa_block_table"],
-        step_context["fa_block_lens"],
-        step_context["fa_seq_lens"],
-        step_context["aissd_rpc_selected_chunk_ids"],
-        step_context["aissd_rpc_selected_chunk_lens"],
-        layer_id,
-        backend,
-        int(num_heads),
-        int(num_kv_heads),
-        int(head_size),
-        int(step_context["chunk_size"]),
-        int(step_context["block_size"]),
-        int(step_context["top_n_chunks"]),
-        int(step_context.get("aissd_top_m", 8)),
-        int(step_context.get("aissd_score_mode_code", 1)),
-        int(step_context.get("aissd_manifest_block_size", 4096)),
-        int(step_context.get("aissd_timeout_ms", 300000)),
+    _aissd_run_native_selector(
+        query, step_context, layer_id, backend, num_heads, num_kv_heads, head_size
     )
     if coarse_plan is not None:
         coarse_finish = step_context.get("aissd_gpu_coarse_finish")
@@ -6615,9 +6713,12 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.aissd_tp_size = (
+            get_tp_group().world_size if model_parallel_is_initialized() else 1
+        )
         self.aissd_model_profile = _aissd_validate_runtime_model_profile(
-            num_heads=int(num_heads),
-            num_kv_heads=int(self.num_kv_heads),
+            num_heads=int(num_heads) * self.aissd_tp_size,
+            num_kv_heads=int(self.num_kv_heads) * self.aissd_tp_size,
             head_size=int(head_size),
         )
         self.sliding_window = sliding_window
@@ -7080,6 +7181,15 @@ class SparseSSDAttentionImpl(AttentionImpl[AttentionMetadata]):
                         )
 
                 sparse_total_prof = _sparse_profile_begin("sparse_forward_total", layer_name, query)
+                if (
+                    self.aissd_tp_size > 1
+                    and step_context.get("aissd_selector_backend")
+                    in ("ssd-cpu", "ssd-npu")
+                    and step_context.get("aissd_tp_size") != self.aissd_tp_size
+                ):
+                    raise RuntimeError(
+                        "SSD Sparse KV TP needs the TP-aware LMCache connector"
+                    )
                 selector_ms = _maybe_run_aissd_selector_op(
                     query=query,
                     step_context=step_context,
